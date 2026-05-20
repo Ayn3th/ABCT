@@ -1,0 +1,17 @@
+*.o
+*.a
+/bin
+/data
+/lib
+
+*.data
+*.trace
+
+*.log
+
+*.sh
+
+Makefile
+mckey_dump
+nodes
+pbsnodes
