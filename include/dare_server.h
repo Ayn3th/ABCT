@@ -92,7 +92,9 @@ struct server_t {
     uint8_t next_lr_step;   // next log replication step 
     uint8_t send_flag;      // flag set for posting send for this EP
     uint8_t send_count;     // number of sends poster for current step
-    uint8_t priority;       // node priority for priority-based leader election
+    uint8_t priority;       // (unused, kept for struct layout compatibility)
+    double target_priority; // local target candidate priority threshold
+    volatile uint64_t conn_probe_counter; // 全连接检测本地计数器
 };
 
 //typedef struct server_t server_t;
@@ -127,6 +129,8 @@ typedef struct sm_rep_t sm_rep_t;
 struct ctrl_data_t {
     /* State identified (SID) */
     uint64_t    sid;
+    uint64_t    conn_probe_counter;  /* full-connectivity probe counter */
+    uint64_t    leader_hb_counter;   /* leader heartbeat counter for follower RDMA reads */
     
     /* DARE arrays */
     vote_req_t    vote_req[MAX_SERVER_COUNT];       /* vote requests */

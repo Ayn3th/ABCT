@@ -25,6 +25,95 @@
 #include <dare_ep_db.h>
 
 #include <timer.h>
+#include <stdint.h>
+#include <errno.h>
+
+extern int rdma_read_counter(uint8_t remote_idx, uint64_t *val);
+extern int rdma_read_leader_hb_counter(uint8_t remote_idx, uint64_t *val);
+
+
+#include <math.h>
+#define HB_RTT_WIN 5
+static double hb_rtt_arr[HB_RTT_WIN] = {0};
+static int hb_rtt_idx = 0;
+static int hb_rtt_count = 0;
+
+// 设定基线和最大容忍时延（单位：秒）
+const double Rbase = 0.0005; // 0.5ms
+const double Rmax  = 0.0100; // 10ms
+
+// 获取 MemAvailable/总内存 作为优先级，返回 [0,1]，失败返回0
+double get_mem_priority() {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0.0;
+    char line[256];
+    uint64_t mem_avail = 0, mem_total = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "MemAvailable: %lu kB", &mem_avail) == 1) continue;
+        if (sscanf(line, "MemTotal: %lu kB", &mem_total) == 1) continue;
+        if (mem_avail && mem_total) break;
+    }
+    fclose(fp);
+    if (mem_total == 0) return 0.0;
+    double prio = (double)mem_avail / (double)mem_total;
+    if (prio < 0) prio = 0.0;
+    if (prio > 1) prio = 1.0;
+    return prio;
+}
+
+// 记录一次RTT（单位：秒）
+void record_hb_rtt(double rtt) {
+    hb_rtt_arr[hb_rtt_idx] = rtt;
+    hb_rtt_idx = (hb_rtt_idx + 1) % HB_RTT_WIN;
+    if (hb_rtt_count < HB_RTT_WIN) hb_rtt_count++;
+}
+
+// 获取最近5次心跳RTT均值
+double get_avg_hb_rtt() {
+    if (hb_rtt_count == 0) return Rbase;
+    double sum = 0.0;
+    for (int i = 0; i < hb_rtt_count; ++i) sum += hb_rtt_arr[i];
+    return sum / hb_rtt_count;
+}
+
+// 网络优先级 [0,1]
+double get_network_priority() {
+    double R = get_avg_hb_rtt();
+    double prio = (Rmax - R) / (Rmax - Rbase);
+    if (prio < 0) prio = 0.0;
+    if (prio > 1) prio = 1.0;
+    return prio;
+}
+
+// 获取CPU优先级 [0,1]，负载越低优先级越高
+double get_cpu_priority() {
+    FILE *fp = fopen("/proc/loadavg", "r");
+    if (!fp) return 0.0;
+    double load1 = 0.0;
+    if (fscanf(fp, "%lf", &load1) != 1) {
+        fclose(fp);
+        return 0.0;
+    }
+    fclose(fp);
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu <= 0) ncpu = 1;
+    double L = load1 / ncpu;
+    if (L < 0) L = 0.0;
+    if (L > 1) L = 1.0;
+    return 1.0 - L;
+}
+
+// 最终优先级 sqrt(网络优先级 * 存储优先级)
+// 最终优先级：cpu优先级 × 网络优先级 × 内存优先级 的立方根
+double get_final_priority() {
+    double mem_p = get_mem_priority();
+    double net_p = get_network_priority();
+    double cpu_p = get_cpu_priority();
+    double final_p = cbrt(cpu_p * net_p * mem_p);
+    if (final_p < 0) final_p = 0.0;
+    if (final_p > 1) final_p = 1.0;
+    return final_p;
+}
 
 /* 
  * HB period (seconds)
@@ -186,6 +275,65 @@ static void
 poll_cb( EV_P_ ev_idle *w, int revents );
 
 /* ================================================================== */
+#define CONN_PROBE_PERIOD 0.5
+#define MAX_SERVER 32
+static uint64_t last_probe_val[MAX_SERVER] = {0};
+
+// 定时器回调：自增本地计数器并检测所有节点
+static void conn_probe_cb(EV_P_ ev_timer *w, int revents) {
+    uint8_t i, size = get_group_size(data.config);
+    int issue_detected = 0;
+    static uint64_t last_leader_hb = 0;
+
+    /* 自增本地探针计数器 */
+    data.ctrl_data->conn_probe_counter++;
+
+    /* 依次RDMA read所有节点的探针计数器 */
+    for (i = 0; i < size; ++i) {
+        if (i == data.config.idx) continue;
+        uint64_t val = 0;
+        if (rdma_read_counter(i, &val) != 0) {
+            info(log_fp, "[CONN_PROBE] Node %d read failed\n", i);
+            issue_detected = 1;
+            continue;
+        }
+        if (last_probe_val[i] == val) {
+            info(log_fp, "[CONN_PROBE] Node %d counter not changed!\n", i);
+            issue_detected = 1;
+        }
+        last_probe_val[i] = val;
+    }
+
+    /* Followers also periodically RDMA read leader heartbeat counter */
+    if (!IS_LEADER && SID_GET_L(data.ctrl_data->sid)) {
+        uint8_t leader = SID_GET_IDX(data.ctrl_data->sid);
+        if (leader != data.config.idx && CID_IS_SERVER_ON(data.config.cid, leader)) {
+            uint64_t leader_hb = 0;
+            if (rdma_read_leader_hb_counter(leader, &leader_hb) == 0) {
+                if (leader_hb != last_leader_hb) {
+                    info(log_fp, "[LEADER_HB_RD] leader p%u hb_counter=%"PRIu64"\n", leader, leader_hb);
+                    last_leader_hb = leader_hb;
+                }
+                else {
+                    info(log_fp, "[LEADER_HB_RD] leader p%u hb_counter unchanged\n", leader);
+                }
+            }
+            else {
+                info(log_fp, "[LEADER_HB_RD] read failed for leader p%u\n", leader);
+                issue_detected = 1;
+            }
+        }
+    }
+
+    if (issue_detected && !IS_LEADER && !IS_CANDIDATE) {
+        info(log_fp, "[CONN_PROBE] issue detected, triggering election\n");
+        start_election();
+    }
+
+    w->repeat = CONN_PROBE_PERIOD;
+    ev_timer_again(EV_A_ w);
+}
+
 /* Init and cleaning up */
 #if 1
 ev_tstamp start_ts;
@@ -250,6 +398,11 @@ int dare_server_init( dare_server_input_t *input )
     ev_timer_init(&to_adjust_event, to_adjust_cb, 0., 0.);
     ev_set_priority(&to_adjust_event, EV_MAXPRI-1);
 
+        // 启动全连接检测定时器
+    static ev_timer conn_probe_timer;
+    ev_timer_init(&conn_probe_timer, conn_probe_cb, CONN_PROBE_PERIOD, CONN_PROBE_PERIOD);
+    ev_timer_start(data.loop, &conn_probe_timer);
+
     /* Now wait for events to arrive */
     ev_run(data.loop, 0);
 
@@ -309,10 +462,8 @@ init_server_data()
     for (i = 0; i < MAX_SERVER_COUNT; i++) {
         data.config.servers[i].next_lr_step = LR_GET_WRITE;
         data.config.servers[i].send_flag = 1;
-        if (i < data.input->group_size)
-            data.config.servers[i].priority = data.input->group_size - i; /* default priority: lower idx => higher priority */
-        else
-            data.config.servers[i].priority = 0;
+        data.config.servers[i].priority = 0; // 不再静态赋值，兼容结构体
+        data.config.servers[i].target_priority = 0.0;
     }
  
     /* Allocate ctrl_data - needs to be 8 bytes aligned for CAS operations */
@@ -904,6 +1055,9 @@ hb_receive_cb( EV_P_ ev_timer *w, int revents )
 //text(log_fp, "\n");    
     
     if (timeout) {
+        if (IS_CANDIDATE && data.config.servers[data.config.idx].target_priority > 0.0) {
+            data.config.servers[data.config.idx].target_priority *= 0.5;
+        }
         w->repeat = 0.;
         ev_timer_again(EV_A_ w);
         start_election(); 
@@ -1578,7 +1732,9 @@ poll_vote_requests()
      */
     uint64_t old_sid = data.ctrl_data->sid; SID_SET_L(old_sid);
 
-    uint8_t my_priority = data.config.servers[data.config.idx].priority;
+
+    double my_priority = get_final_priority();
+    double target_priority = data.config.servers[data.config.idx].target_priority;
 
     TIMER_INIT;
     TIMER_START(log_fp, "Vote request from a good candidate...");
@@ -1656,8 +1812,8 @@ poll_vote_requests()
             best_request.cid = request->cid;
         }
 
-        /* Priority filtering: only consider if candidate's priority > my_priority */
-        if (request->priority > my_priority) {
+        /* Priority filtering: only consider if candidate's priority > local target priority */
+        if (request->priority > target_priority) {
             if (!have_priority_candidate) {
                 priority_choice = *request;
                 have_priority_candidate = 1;
@@ -1697,6 +1853,7 @@ poll_vote_requests()
 
     /* Use chosen priority candidate as the vote target */
     best_request = priority_choice;
+    data.config.servers[data.config.idx].target_priority = priority_choice.priority;
 text(log_fp, "   Best [idx=%"PRIu64"; term=%"PRIu64"]\n", best_request.index, best_request.term);
 
     if (best_request.sid == old_sid) {

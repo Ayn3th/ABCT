@@ -115,6 +115,39 @@ cmpfunc_uint64( const void *a, const void *b );
 
 
 /* ================================================================== */
+#include <stddef.h>
+#include <string.h>
+static int rdma_read_ctrl_uint64(uint8_t remote_idx, size_t field_offset, uint64_t *val) {
+    if (remote_idx == SRV_DATA->config.idx) return -1;
+    dare_ib_ep_t* ep = (dare_ib_ep_t*)SRV_DATA->config.servers[remote_idx].ep;
+    if (!ep || !ep->rc_connected) return -1;
+
+    int posted_sends[MAX_SERVER_COUNT];
+    memset(posted_sends, -1, sizeof(posted_sends));
+    uint64_t buf = 0;
+    rem_mem_t rm;
+    rm.raddr = ep->rc_ep.rmt_mr[CTRL_QP].raddr + field_offset;
+    rm.rkey = ep->rc_ep.rmt_mr[CTRL_QP].rkey;
+
+    posted_sends[remote_idx] = 1;
+    int rc = post_send(remote_idx, CTRL_QP, &buf, sizeof(uint64_t), IBDEV->lcl_mr[CTRL_QP], IBV_WR_RDMA_READ, SIGNALED, rm, posted_sends);
+    if (0 != rc) return -1;
+
+    rc = wait_for_one(posted_sends, CTRL_QP);
+    if (rc != RC_SUCCESS) return -1;
+
+    *val = buf;
+    return 0;
+}
+
+int rdma_read_counter(uint8_t remote_idx, uint64_t *val) {
+    return rdma_read_ctrl_uint64(remote_idx, offsetof(ctrl_data_t, conn_probe_counter), val);
+}
+
+int rdma_read_leader_hb_counter(uint8_t remote_idx, uint64_t *val) {
+    return rdma_read_ctrl_uint64(remote_idx, offsetof(ctrl_data_t, leader_hb_counter), val);
+}
+
 /* Init and cleaning up */
 #if 1
 /**
@@ -874,6 +907,9 @@ int rc_send_hb()
     uint8_t i, size;
     
     TIMER_INIT;
+
+    /* Increase leader heartbeat counter */
+    SRV_DATA->ctrl_data->leader_hb_counter++;
     
     /* No need to send HBs to servers in the extended config */
     size = get_group_size(SRV_DATA->config);
@@ -994,8 +1030,8 @@ int rc_send_vote_request()
         request->term = last_entry->term;
     }
     request->cid = SRV_DATA->config.cid;
-        /* Include local priority in the vote request */
-        request->priority = SRV_DATA->config.servers[idx].priority;
+        /* Include local priority in the vote request: 动态获取（最终优先级） */
+        request->priority = (uint8_t)(get_final_priority() * 255.0);
     //debug(log_fp, "sending vote request L.E.: idx=%"PRIu64"; term=%"PRIu64"\n", 
     //        request->index, request->term);
 
